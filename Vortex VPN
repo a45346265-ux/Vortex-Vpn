@@ -1,0 +1,2280 @@
+# ═══════════════════════════════════════════════════════════
+#         VORTEX VPN BOT — LITE (компактная версия)
+#         Всё ядро + колесо + скидки для топ-4-10
+# ═══════════════════════════════════════════════════════════
+
+import asyncio
+import logging
+import os
+import random
+from datetime import datetime, timedelta
+
+import aiosqlite
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.exceptions import TelegramForbiddenError
+from aiogram.filters import Command, CommandObject
+from aiogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, LabeledPrice, PreCheckoutQuery,
+)
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+
+try:
+    from aiosend import CryptoPay, Networks
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
+
+
+# ═══════════════════════════════════════════════════════════
+#                        НАСТРОЙКИ
+# ═══════════════════════════════════════════════════════════
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬ_ТОКЕН")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
+DB_NAME = "keys.db"
+
+REF_BONUS_DAYS = 2
+REF_BONUS_PAID_DAYS = 3
+REF_BONUS_REQUIRE_PAID = True
+TRIAL_DAYS = 1
+BONUS_WITHDRAW_THRESHOLD = 10
+BONUS_WITHDRAW_AMOUNT = 10
+
+CRYPTO_PAY_TOKEN = os.getenv("CRYPTO_PAY_TOKEN", "")
+CRYPTO_PAY_NETWORK = os.getenv("CRYPTO_PAY_NETWORK", "testnet")
+CRYPTO_PAY_ASSET = "USDT"
+CRYPTO_PAY_RATE = 0.011
+
+# ─── Колесо фортуны ───
+SPIN_FREE_COOLDOWN_DAYS = 3
+SPIN_PAID_COST = 10
+SPIN_ENABLED = True
+SPIN_PRIZES = [
+    ("empty", 0,  15),
+    ("star",  1,  30),
+    ("star",  3,  25),
+    ("star",  5,  15),
+    ("star",  10, 8),
+    ("star",  15, 4),
+    ("star",  25, 2),
+    ("day",   1,  0.8),
+    ("day",   7,  0.2),
+]
+
+# ─── Топ спинов ───
+SPIN_LEADERBOARD_ENABLED = True
+SPIN_LEADERBOARD_LIMIT = 10
+SPIN_WEEKLY_PRIZES = {
+    1: {"stars": 15, "spins": 3},
+    2: {"stars": 10, "spins": 2},
+    3: {"stars": 5,  "spins": 1},
+}
+
+# ─── Прогрессивная скидка для мест 4-10 ───
+LEADERBOARD_DISCOUNTS = {
+    4: 15, 5: 15,
+    6: 10, 7: 10, 8: 10, 9: 10, 10: 10,
+}
+
+def get_leaderboard_discount(place: int) -> int:
+    return LEADERBOARD_DISCOUNTS.get(place, 0)
+
+
+DURATION_DAYS = {"1_month": 30, "3_months": 90, "6_months": 180,
+                 "12_months": 365, "trial": 1}
+
+TARIFFS = {
+    "1_month":   {"name": "1 месяц",    "price": "149 ₽", "stars": 75,  "desc": "1 устройство"},
+    "3_months":  {"name": "3 месяца",   "price": "349 ₽", "stars": 175, "desc": "до 3 устройств"},
+    "6_months":  {"name": "6 месяцев",  "price": "599 ₽", "stars": 300, "desc": "до 5 устройств"},
+    "12_months": {"name": "12 месяцев", "price": "999 ₽", "stars": 500, "desc": "до 5 устройств + приоритет"},
+}
+
+
+# ═══════════════════════════════════════════════════════════
+#                       ЛОГИРОВАНИЕ
+# ═══════════════════════════════════════════════════════════
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("vortex")
+logging.getLogger("aiogram").setLevel(logging.WARNING)
+
+
+# ═══════════════════════════════════════════════════════════
+#                     ГЛОБАЛЬНЫЕ ОБЪЕКТЫ
+# ═══════════════════════════════════════════════════════════
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+cp = None
+if CRYPTO_AVAILABLE and CRYPTO_PAY_TOKEN:
+    try:
+        network = Networks.MAIN_NET if CRYPTO_PAY_NETWORK == "mainnet" else Networks.TEST_NET
+        cp = CryptoPay(CRYPTO_PAY_TOKEN, network=network)
+        logger.info(f"CryptoPay: {CRYPTO_PAY_NETWORK}")
+    except Exception as e:
+        logger.error(f"CryptoPay: {e}")
+
+
+# ═══════════════════════════════════════════════════════════
+#                     БАЗА ДАННЫХ
+# ═══════════════════════════════════════════════════════════
+
+_db_conn: aiosqlite.Connection | None = None
+
+
+async def db_init():
+    global _db_conn
+    _db_conn = await aiosqlite.connect(DB_NAME)
+    _db_conn.row_factory = aiosqlite.Row
+    await _db_conn.execute("PRAGMA journal_mode=WAL")
+    await _db_conn.executescript("""
+        CREATE TABLE IF NOT EXISTS keys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tariff TEXT NOT NULL,
+            key_value TEXT NOT NULL UNIQUE,
+            is_used INTEGER DEFAULT 0,
+            used_by_id INTEGER,
+            used_by_username TEXT,
+            used_at TEXT,
+            expire_date TEXT,
+            reminded_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            referrer_id INTEGER,
+            bonus_days INTEGER DEFAULT 0,
+            stars_balance INTEGER DEFAULT 0,
+            got_trial INTEGER DEFAULT 0,
+            created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS sales (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            tariff TEXT,
+            amount_stars INTEGER,
+            created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS promo_codes (
+            code TEXT PRIMARY KEY,
+            days INTEGER DEFAULT 0,
+            stars INTEGER DEFAULT 0,
+            spins INTEGER DEFAULT 0,
+            max_uses INTEGER DEFAULT 1,
+            used_count INTEGER DEFAULT 0,
+            is_active INTEGER DEFAULT 1,
+            created_by INTEGER,
+            created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS promo_uses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT,
+            user_id INTEGER,
+            kind TEXT,
+            value INTEGER,
+            used_at TEXT,
+            UNIQUE(code, user_id, kind)
+        );
+        CREATE TABLE IF NOT EXISTS spin_cooldown (
+            user_id INTEGER PRIMARY KEY,
+            last_free_spin TEXT,
+            spins_available INTEGER DEFAULT 0,
+            spin_reminded_at TEXT,
+            total_spins INTEGER DEFAULT 0,
+            total_won_stars INTEGER DEFAULT 0,
+            total_won_days INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS spin_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            prize_type TEXT NOT NULL,
+            value INTEGER NOT NULL,
+            is_free INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS user_discounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            percent INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            place INTEGER NOT NULL,
+            expires_at TEXT NOT NULL,
+            used_at TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_keys_used_by ON keys(used_by_id, is_used);
+        CREATE INDEX IF NOT EXISTS idx_keys_tariff_free ON keys(tariff, is_used);
+        CREATE INDEX IF NOT EXISTS idx_users_ref ON users(referrer_id);
+        CREATE INDEX IF NOT EXISTS idx_spin_hist_user ON spin_history(user_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_discounts ON user_discounts(user_id, used_at);
+    """)
+    await _db_conn.commit()
+
+    # ─── Миграции для старых БД ───
+    migrations = [
+        ("keys", "reminded_at", "TEXT"),
+        ("users", "stars_balance", "INTEGER DEFAULT 0"),
+        ("promo_codes", "spins", "INTEGER DEFAULT 0"),
+        ("spin_cooldown", "spins_available", "INTEGER DEFAULT 0"),
+        ("spin_cooldown", "spin_reminded_at", "TEXT"),
+    ]
+    for table, col, typedef in migrations:
+        async with _db_conn.execute(f"PRAGMA table_info({table})") as cur:
+            cols = [r[1] async for r in cur]
+        if col not in cols:
+            try:
+                await _db_conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}")
+            except Exception as e:
+                logger.warning(f"Migration {table}.{col}: {e}")
+    await _db_conn.commit()
+    logger.info("БД готова")
+
+
+# ─── Users ───
+async def register_user(user_id, username=None, referrer_id=None) -> bool:
+    async with _db_conn.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,)) as cur:
+        if await cur.fetchone():
+            return False
+    await _db_conn.execute(
+        "INSERT INTO users (user_id, username, referrer_id, created_at) VALUES (?,?,?,?)",
+        (user_id, username, referrer_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    await _db_conn.commit()
+    return True
+
+
+async def user_exists(uid) -> bool:
+    async with _db_conn.execute("SELECT 1 FROM users WHERE user_id=?", (uid,)) as cur:
+        return await cur.fetchone() is not None
+
+
+async def get_user(uid):
+    async with _db_conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)) as cur:
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def get_referrer(uid):
+    async with _db_conn.execute("SELECT referrer_id FROM users WHERE user_id=?", (uid,)) as cur:
+        row = await cur.fetchone()
+        return row["referrer_id"] if row and row["referrer_id"] else None
+
+
+async def count_referrals(uid) -> int:
+    async with _db_conn.execute("SELECT COUNT(*) AS c FROM users WHERE referrer_id=?", (uid,)) as cur:
+        return (await cur.fetchone())["c"]
+
+
+async def user_has_paid(uid) -> bool:
+    async with _db_conn.execute("SELECT 1 FROM sales WHERE user_id=? LIMIT 1", (uid,)) as cur:
+        return await cur.fetchone() is not None
+
+
+async def get_all_user_ids():
+    async with _db_conn.execute("SELECT user_id FROM users") as cur:
+        return [r["user_id"] async for r in cur]
+
+
+# ─── Bonus days ───
+async def add_bonus_days(uid, days):
+    await _db_conn.execute("UPDATE users SET bonus_days = bonus_days + ? WHERE user_id=?", (days, uid))
+    await _db_conn.commit()
+
+
+async def get_bonus_days(uid) -> int:
+    async with _db_conn.execute("SELECT bonus_days FROM users WHERE user_id=?", (uid,)) as cur:
+        row = await cur.fetchone()
+        return row["bonus_days"] if row else 0
+
+
+async def withdraw_bonus(uid, amount) -> bool:
+    cur = await _db_conn.execute(
+        "UPDATE users SET bonus_days = bonus_days - ? WHERE user_id=? AND bonus_days >= ?",
+        (amount, uid, amount))
+    await _db_conn.commit()
+    return cur.rowcount > 0
+
+
+# ─── Stars balance ───
+async def get_stars(uid) -> int:
+    async with _db_conn.execute("SELECT stars_balance FROM users WHERE user_id=?", (uid,)) as cur:
+        row = await cur.fetchone()
+        return row["stars_balance"] if row else 0
+
+
+async def add_stars(uid, amount) -> int:
+    await _db_conn.execute("UPDATE users SET stars_balance = stars_balance + ? WHERE user_id=?",
+                           (amount, uid))
+    await _db_conn.commit()
+    return await get_stars(uid)
+
+
+async def spend_stars(uid, amount) -> bool:
+    if amount <= 0:
+        return True
+    cur = await _db_conn.execute(
+        "UPDATE users SET stars_balance = stars_balance - ? WHERE user_id=? AND stars_balance >= ?",
+        (amount, uid, amount))
+    await _db_conn.commit()
+    return cur.rowcount > 0
+
+
+# ─── Keys ───
+async def add_key(tariff, key_value) -> bool:
+    try:
+        await _db_conn.execute("INSERT INTO keys (tariff, key_value) VALUES (?,?)", (tariff, key_value))
+        await _db_conn.commit()
+        return True
+    except aiosqlite.IntegrityError:
+        return False
+
+
+async def get_available_key(tariff):
+    async with _db_conn.execute(
+        "SELECT id, key_value FROM keys WHERE tariff=? AND is_used=0 LIMIT 1", (tariff,)
+    ) as cur:
+        row = await cur.fetchone()
+        return (row["id"], row["key_value"]) if row else None
+
+
+async def mark_key_used(key_id, uid, username, expire_date):
+    await _db_conn.execute(
+        "UPDATE keys SET is_used=1, used_by_id=?, used_by_username=?, used_at=?, expire_date=? WHERE id=?",
+        (uid, username, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), expire_date, key_id))
+    await _db_conn.commit()
+
+
+async def extend_user_key(uid, days):
+    async with _db_conn.execute(
+        "SELECT id, expire_date FROM keys WHERE used_by_id=? AND is_used=1 ORDER BY used_at DESC LIMIT 1",
+        (uid,)
+    ) as cur:
+        row = await cur.fetchone()
+    if not row:
+        return None
+    key_id, old_expire = row["id"], row["expire_date"]
+    try:
+        old_dt = datetime.strptime(old_expire, "%d.%m.%Y")
+    except Exception:
+        old_dt = datetime.now()
+    new_dt = (old_dt if old_dt > datetime.now() else datetime.now()) + timedelta(days=days)
+    new_expire = new_dt.strftime("%d.%m.%Y")
+    await _db_conn.execute("UPDATE keys SET expire_date=?, reminded_at=NULL WHERE id=?",
+                           (new_expire, key_id))
+    await _db_conn.commit()
+    return new_expire
+
+
+async def get_user_active_key(uid):
+    async with _db_conn.execute(
+        "SELECT key_value, expire_date, tariff FROM keys WHERE used_by_id=? AND is_used=1 "
+        "ORDER BY used_at DESC LIMIT 1", (uid,)
+    ) as cur:
+        row = await cur.fetchone()
+        return (row["key_value"], row["expire_date"], row["tariff"]) if row else None
+
+
+async def count_available_keys(tariff=None) -> int:
+    if tariff:
+        async with _db_conn.execute(
+            "SELECT COUNT(*) AS c FROM keys WHERE tariff=? AND is_used=0", (tariff,)
+        ) as cur:
+            return (await cur.fetchone())["c"]
+    async with _db_conn.execute("SELECT COUNT(*) AS c FROM keys WHERE is_used=0") as cur:
+        return (await cur.fetchone())["c"]
+
+
+async def get_expiring_keys(days_before=2):
+    target = (datetime.now() + timedelta(days=days_before)).strftime("%d.%m.%Y")
+    async with _db_conn.execute(
+        "SELECT id, used_by_id FROM keys WHERE is_used=1 AND expire_date=? "
+        "AND (reminded_at IS NULL OR reminded_at='')", (target,)
+    ) as cur:
+        rows = [dict(r) async for r in cur]
+    return [(r["id"], r["used_by_id"], target) for r in rows]
+
+
+async def mark_reminded(key_id):
+    await _db_conn.execute("UPDATE keys SET reminded_at=? WHERE id=?",
+                           (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), key_id))
+    await _db_conn.commit()
+
+
+def days_left(expire_str):
+    try:
+        return max(0, (datetime.strptime(expire_str, "%d.%m.%Y") - datetime.now()).days)
+    except Exception:
+        return 0
+
+
+# ─── Sales / Stats ───
+async def add_sale(uid, tariff, stars):
+    await _db_conn.execute(
+        "INSERT INTO sales (user_id, tariff, amount_stars, created_at) VALUES (?,?,?,?)",
+        (uid, tariff, stars, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    await _db_conn.commit()
+
+
+async def get_stats():
+    async with _db_conn.execute("SELECT COUNT(*) AS c FROM users") as cur:
+        users = (await cur.fetchone())["c"]
+    async with _db_conn.execute(
+        "SELECT COUNT(*) AS c, COALESCE(SUM(amount_stars),0) AS s FROM sales"
+    ) as cur:
+        r = await cur.fetchone()
+        sales, stars = r["c"], r["s"]
+    async with _db_conn.execute("SELECT COUNT(*) AS c FROM keys WHERE is_used=0") as cur:
+        free_keys = (await cur.fetchone())["c"]
+    async with _db_conn.execute("SELECT COUNT(*) AS c FROM keys WHERE is_used=1") as cur:
+        used_keys = (await cur.fetchone())["c"]
+    return {"users": users, "sales": sales, "stars": stars,
+            "free_keys": free_keys, "used_keys": used_keys}
+
+
+# ─── Promo ───
+async def create_promo(code, days, stars, max_uses, created_by, spins=0):
+    try:
+        await _db_conn.execute(
+            "INSERT INTO promo_codes (code, days, stars, spins, max_uses, created_by, created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (code.upper(), days, stars, spins, max_uses, created_by,
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        await _db_conn.commit()
+        return True
+    except aiosqlite.IntegrityError:
+        return False
+
+
+async def get_promo(code):
+    async with _db_conn.execute(
+        "SELECT * FROM promo_codes WHERE code=? AND is_active=1", (code.upper(),)
+    ) as cur:
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def promo_was_used(code, uid) -> bool:
+    async with _db_conn.execute(
+        "SELECT 1 FROM promo_uses WHERE code=? AND user_id=? LIMIT 1", (code.upper(), uid)
+    ) as cur:
+        return await cur.fetchone() is not None
+
+
+async def promo_inc_used(code):
+    await _db_conn.execute(
+        "UPDATE promo_codes SET used_count = used_count + 1 WHERE code=?", (code.upper(),))
+    await _db_conn.commit()
+
+
+async def list_promos():
+    async with _db_conn.execute(
+        "SELECT * FROM promo_codes WHERE is_active=1 ORDER BY created_at DESC"
+    ) as cur:
+        return [dict(r) async for r in cur]
+
+
+async def delete_promo(code) -> bool:
+    cur = await _db_conn.execute("DELETE FROM promo_codes WHERE code=?", (code.upper(),))
+    await _db_conn.commit()
+    return cur.rowcount > 0
+
+
+async def log_promo_use(code, uid, kind, value):
+    try:
+        await _db_conn.execute(
+            "INSERT INTO promo_uses (code, user_id, kind, value, used_at) VALUES (?,?,?,?,?)",
+            (code.upper(), uid, kind, value, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        await _db_conn.commit()
+        return True
+    except aiosqlite.IntegrityError:
+        return False
+
+
+# ─── Колесо фортуны ───
+def spin_wheel():
+    total = sum(w for _, _, w in SPIN_PRIZES)
+    r = random.uniform(0, total)
+    upto = 0
+    for prize_type, value, weight in SPIN_PRIZES:
+        if upto + weight >= r:
+            return prize_type, value
+        upto += weight
+    return "empty", 0
+
+
+def fmt_seconds(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds} сек"
+    if seconds < 3600:
+        return f"{seconds // 60} мин"
+    if seconds < 86400:
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        return f"{h} ч {m} мин"
+    d = seconds // 86400
+    h = (seconds % 86400) // 3600
+    return f"{d} д {h} ч"
+
+
+async def get_spin_cooldown(uid):
+    async with _db_conn.execute(
+        "SELECT * FROM spin_cooldown WHERE user_id=?", (uid,)
+    ) as cur:
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def get_free_spins(uid) -> int:
+    async with _db_conn.execute(
+        "SELECT spins_available FROM spin_cooldown WHERE user_id=?", (uid,)
+    ) as cur:
+        row = await cur.fetchone()
+    return (row["spins_available"] or 0) if row else 0
+
+
+async def add_free_spins(uid, count):
+    async with _db_conn.execute(
+        "SELECT user_id FROM spin_cooldown WHERE user_id=?", (uid,)
+    ) as cur:
+        exists = await cur.fetchone()
+    if exists:
+        await _db_conn.execute(
+            "UPDATE spin_cooldown SET spins_available = spins_available + ? WHERE user_id=?",
+            (count, uid))
+    else:
+        await _db_conn.execute(
+            "INSERT INTO spin_cooldown (user_id, spins_available) VALUES (?, ?)",
+            (uid, count))
+    await _db_conn.commit()
+
+
+async def use_free_spin(uid) -> bool:
+    cur = await _db_conn.execute(
+        "UPDATE spin_cooldown SET spins_available = spins_available - 1 "
+        "WHERE user_id=? AND spins_available > 0", (uid,))
+    await _db_conn.commit()
+    return cur.rowcount > 0
+
+
+async def can_free_spin(uid) -> tuple[bool, int, bool]:
+    bonus_spins = await get_free_spins(uid)
+    if bonus_spins > 0:
+        return True, 0, True
+    cd = await get_spin_cooldown(uid)
+    if not cd or not cd["last_free_spin"]:
+        return True, 0, False
+    try:
+        last = datetime.strptime(cd["last_free_spin"], "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return True, 0, False
+    delta = (datetime.now() - last).total_seconds()
+    cooldown = SPIN_FREE_COOLDOWN_DAYS * 24 * 3600
+    if delta >= cooldown:
+        return True, 0, False
+    return False, int(cooldown - delta), False
+
+
+async def record_spin(uid, prize_type, value, is_free):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    await _db_conn.execute(
+        "INSERT INTO spin_history (user_id, prize_type, value, is_free, created_at) "
+        "VALUES (?,?,?,?,?)", (uid, prize_type, value, int(is_free), now))
+    await _db_conn.execute(
+        "UPDATE spin_cooldown SET spin_reminded_at = NULL WHERE user_id = ?", (uid,))
+
+    stars_add = value if prize_type == "star" else 0
+    days_add = value if prize_type == "day" else 0
+
+    async with _db_conn.execute(
+        "SELECT user_id FROM spin_cooldown WHERE user_id=?", (uid,)
+    ) as cur:
+        exists = await cur.fetchone()
+
+    if exists:
+        if is_free:
+            await _db_conn.execute(
+                "UPDATE spin_cooldown SET last_free_spin=?, "
+                "total_spins=total_spins+1, total_won_stars=total_won_stars+?, "
+                "total_won_days=total_won_days+? WHERE user_id=?",
+                (now, stars_add, days_add, uid))
+        else:
+            await _db_conn.execute(
+                "UPDATE spin_cooldown SET total_spins=total_spins+1, "
+                "total_won_stars=total_won_stars+?, total_won_days=total_won_days+? "
+                "WHERE user_id=?", (stars_add, days_add, uid))
+    else:
+        await _db_conn.execute(
+            "INSERT INTO spin_cooldown (user_id, last_free_spin, total_spins, "
+            "total_won_stars, total_won_days) VALUES (?,?,?,?,?)",
+            (uid, now if is_free else None, 1, stars_add, days_add))
+    await _db_conn.commit()
+
+
+async def get_spin_stats(uid):
+    cd = await get_spin_cooldown(uid)
+    if not cd:
+        return {"total_spins": 0, "total_won_stars": 0, "total_won_days": 0}
+    return {
+        "total_spins": cd.get("total_spins") or 0,
+        "total_won_stars": cd.get("total_won_stars") or 0,
+        "total_won_days": cd.get("total_won_days") or 0,
+    }
+
+
+async def get_users_to_remind_spin(hours_ahead: int = 1):
+    cooldown = SPIN_FREE_COOLDOWN_DAYS * 24 * 3600
+    threshold = cooldown - hours_ahead * 3600
+    async with _db_conn.execute("""
+        SELECT user_id, last_free_spin FROM spin_cooldown
+        WHERE last_free_spin IS NOT NULL
+          AND (spin_reminded_at IS NULL OR spin_reminded_at = '')
+    """) as cur:
+        rows = [dict(r) async for r in cur]
+    result = []
+    now = datetime.now()
+    for r in rows:
+        try:
+            last = datetime.strptime(r["last_free_spin"], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            continue
+        if (now - last).total_seconds() >= threshold:
+            result.append(r["user_id"])
+    return result
+
+
+async def mark_spin_reminded(uid):
+    await _db_conn.execute(
+        "UPDATE spin_cooldown SET spin_reminded_at = ? WHERE user_id = ?",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), uid))
+    await _db_conn.commit()
+
+
+async def get_inactive_spinners(days: int = 7):
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    async with _db_conn.execute("""
+        SELECT user_id FROM spin_cooldown
+        WHERE last_free_spin IS NOT NULL AND last_free_spin < ?
+          AND (spin_reminded_at IS NULL OR spin_reminded_at = '')
+    """, (cutoff,)) as cur:
+        return [r["user_id"] async for r in cur]
+
+
+async def mark_inactive_reminded(uid):
+    await _db_conn.execute(
+        "UPDATE spin_cooldown SET spin_reminded_at = ? WHERE user_id = ?",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), uid))
+    await _db_conn.commit()
+
+
+# ─── Таблица лидеров спинов ───
+async def get_spin_leaderboard(limit: int = 10, days: int = 7):
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    async with _db_conn.execute("""
+        SELECT user_id,
+               COUNT(*) AS spins_count,
+               COALESCE(SUM(CASE WHEN prize_type='star' THEN value ELSE 0 END), 0) AS total_stars,
+               COALESCE(SUM(CASE WHEN prize_type='day' THEN value ELSE 0 END), 0) AS total_days
+        FROM spin_history
+        WHERE created_at >= ?
+        GROUP BY user_id
+        HAVING spins_count > 0
+        ORDER BY total_stars DESC, spins_count DESC
+        LIMIT ?
+    """, (cutoff, limit)) as cur:
+        return [dict(r) async for r in cur]
+
+
+async def get_user_spin_rank(uid, days: int = 7):
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    async with _db_conn.execute("""
+        SELECT COUNT(*) AS spins_count,
+               COALESCE(SUM(CASE WHEN prize_type='star' THEN value ELSE 0 END), 0) AS total_stars,
+               COALESCE(SUM(CASE WHEN prize_type='day' THEN value ELSE 0 END), 0) AS total_days
+        FROM spin_history WHERE user_id = ? AND created_at >= ?
+    """, (uid, cutoff)) as cur:
+        row = await cur.fetchone()
+    if not row or row["spins_count"] == 0:
+        return None
+    async with _db_conn.execute("""
+        SELECT COUNT(*) AS rank FROM (
+            SELECT user_id,
+                   COALESCE(SUM(CASE WHEN prize_type='star' THEN value ELSE 0 END), 0) AS total_stars,
+                   COUNT(*) AS spins_count
+            FROM spin_history WHERE created_at >= ?
+            GROUP BY user_id
+        )
+        WHERE total_stars > ? OR (total_stars = ? AND spins_count > ?)
+    """, (cutoff, row["total_stars"], row["total_stars"], row["spins_count"])) as cur:
+        rank_row = await cur.fetchone()
+    return {
+        "rank": (rank_row["rank"] or 0) + 1,
+        "spins_count": row["spins_count"],
+        "total_stars": row["total_stars"],
+        "total_days": row["total_days"],
+    }
+
+
+async def already_spin_rewarded(uid, week_start):
+    async with _db_conn.execute(
+        "SELECT 1 FROM spin_weekly_winners WHERE user_id=? AND week_start=? LIMIT 1",
+        (uid, week_start),
+    ) as cur:
+        return await cur.fetchone() is not None
+
+
+async def log_spin_weekly_winner(week_start, week_end, place, uid,
+                                  spins_count, stars_won, days_won,
+                                  awarded_stars, awarded_spins):
+    await _db_conn.execute("""
+        INSERT INTO spin_weekly_winners
+            (week_start, week_end, place, user_id, spins_count,
+             stars_won, days_won, awarded_stars, awarded_spins, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (week_start, week_end, place, uid, spins_count,
+          stars_won, days_won, awarded_stars, awarded_spins,
+          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    await _db_conn.commit()
+
+
+# ─── Скидки ───
+async def grant_discount(uid, percent, source, place):
+    await _db_conn.execute("""
+        INSERT INTO user_discounts (user_id, percent, source, place, expires_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (uid, percent, source, place, "9999-12-31 23:59:59",
+          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    await _db_conn.commit()
+
+
+async def get_active_discount(uid):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    async with _db_conn.execute("""
+        SELECT * FROM user_discounts
+        WHERE user_id = ? AND used_at IS NULL AND expires_at > ?
+        ORDER BY percent DESC LIMIT 1
+    """, (uid, now)) as cur:
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def use_discount(discount_id):
+    await _db_conn.execute(
+        "UPDATE user_discounts SET used_at = ? WHERE id = ?",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), discount_id))
+    await _db_conn.commit()
+
+
+def apply_discount(price: int, percent: int) -> int:
+    return max(1, int(price * (100 - percent) / 100))
+# ═══════════════════════════════════════════════════════════
+#                     КЛАВИАТУРЫ
+# ═══════════════════════════════════════════════════════════
+
+class Order(StatesGroup):
+    waiting_promo = State()
+    waiting_contact = State()
+    waiting_broadcast = State()
+
+
+def main_menu():
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="📦 Тарифы"), KeyboardButton(text="📱 Моя подписка")],
+        [KeyboardButton(text="⭐ Мой баланс"), KeyboardButton(text="👥 Рефералка")],
+        [KeyboardButton(text="🎰 Колесо фортуны"), KeyboardButton(text="🎟 Промокод")],
+        [KeyboardButton(text="💬 Поддержка"), KeyboardButton(text="ℹ️ О сервисе")],
+    ], resize_keyboard=True)
+
+
+def tariffs_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{t['name']} — {t['price']}", callback_data=f"buy_{k}")]
+        for k, t in TARIFFS.items()
+    ])
+
+
+def pay_kb(tariff_key):
+    rows = [[InlineKeyboardButton(text="⭐ Оплатить Stars",
+                                  callback_data=f"pay_stars_{tariff_key}")]]
+    if cp is not None:
+        rows.append([InlineKeyboardButton(text="🪙 CryptoBot",
+                                          callback_data=f"pay_crypto_{tariff_key}")])
+    rows.append([InlineKeyboardButton(text="💬 Связаться",
+                                      callback_data=f"pay_contact_{tariff_key}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def key_buttons(key_value):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📲 Открыть в Happ",
+                              url=f"https://t.me/share/url?url={key_value}")],
+        [InlineKeyboardButton(text="📲 Открыть в Incy",
+                              url=f"https://t.me/share/url?url={key_value}")],
+    ])
+
+
+def spin_keyboard(can_free: bool, is_bonus: bool = False,
+                  bonus_count: int = 0) -> InlineKeyboardMarkup:
+    rows = []
+    if can_free:
+        label = (f"🎁 Крутить бесплатно ({bonus_count} шт.)"
+                 if is_bonus else "🎁 Крутить бесплатно")
+        rows.append([InlineKeyboardButton(text=label, callback_data="spin_free")])
+    rows.append([InlineKeyboardButton(
+        text=f"⭐ Крутить за {SPIN_PAID_COST} ⭐", callback_data="spin_paid")])
+    rows.append([
+        InlineKeyboardButton(text="🏆 Топ спинов", callback_data="spin_leaderboard"),
+        InlineKeyboardButton(text="📊 Моя стата", callback_data="spin_stats"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def is_admin(msg):
+    return msg.from_user.id == ADMIN_ID
+
+
+# ═══════════════════════════════════════════════════════════
+#                   ВЫДАЧА ПОДПИСКИ
+# ═══════════════════════════════════════════════════════════
+
+async def grant_subscription(user, tariff_key, tariff, paid_stars=0):
+    base_days = DURATION_DAYS.get(tariff_key, 30)
+    new_expire = await extend_user_key(user.id, base_days)
+    if new_expire:
+        await add_sale(user.id, tariff_key, paid_stars)
+        data = await get_user_active_key(user.id)
+        key_value = data[0] if data else "—"
+        try:
+            await bot.send_message(user.id,
+                f"✅ <b>Подписка продлена!</b>\n\n"
+                f"📦 {tariff['name']}\n📅 до <b>{new_expire}</b>\n\n"
+                f"🔑 <code>{key_value}</code>",
+                reply_markup=key_buttons(key_value), parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"notify: {e}")
+        return True
+
+    key_data = await get_available_key(tariff_key)
+    if not key_data:
+        try:
+            await bot.send_message(user.id, "⚠️ Нет ключей. Напишите @Artem_Vladimirovich0")
+            await bot.send_message(ADMIN_ID, f"⚠️ Нет ключей! {tariff_key} / {user.id}")
+        except Exception:
+            pass
+        return False
+
+    key_id, key_value = key_data
+    expire_date = (datetime.now() + timedelta(days=base_days)).strftime("%d.%m.%Y")
+    await mark_key_used(key_id, user.id, user.username or "", expire_date)
+    await add_sale(user.id, tariff_key, paid_stars)
+    try:
+        await bot.send_message(user.id,
+            f"✅ <b>Подписка активирована!</b>\n\n"
+            f"📦 {tariff['name']}\n📅 до <b>{expire_date}</b>\n\n"
+            f"🔑 <code>{key_value}</code>",
+            reply_markup=key_buttons(key_value), parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"notify: {e}")
+    return True
+
+
+async def apply_referral_paid(user):
+    rid = await get_referrer(user.id)
+    if not rid:
+        return
+    if await log_promo_use(f"ref_paid_{rid}", user.id, "paid", REF_BONUS_PAID_DAYS):
+        if REF_BONUS_REQUIRE_PAID and not await user_has_paid(rid):
+            return
+        await add_bonus_days(rid, REF_BONUS_PAID_DAYS)
+        try:
+            new_bonus = await get_bonus_days(rid)
+            hint = (f"💎 Всего: <b>{new_bonus}</b> — можно забрать!"
+                    if new_bonus >= BONUS_WITHDRAW_THRESHOLD
+                    else f"🔒 Всего: <b>{new_bonus}</b>, до снятия "
+                         f"{BONUS_WITHDRAW_THRESHOLD - new_bonus}")
+            await bot.send_message(rid,
+                f"💰 <b>+{REF_BONUS_PAID_DAYS} дня!</b>\n\nВаш друг оплатил!{hint}",
+                parse_mode="HTML")
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════
+#                     START / HELP
+# ═══════════════════════════════════════════════════════════
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message, command: CommandObject):
+    user = message.from_user
+    referrer_id = None
+
+    if command.args and command.args.startswith("ref_"):
+        try:
+            rid = int(command.args.split("_", 1)[1])
+            if rid != user.id and await user_exists(rid):
+                referrer_id = rid
+        except Exception:
+            pass
+
+    is_new = await register_user(user.id, user.username, referrer_id)
+
+    await message.answer(
+        "🔥 <b>Vortex VPN</b>\n\n"
+        "Быстрый и стабильный VPN\n"
+        "🌍 17 локаций\n"
+        "🎁 1 день бесплатно\n\n"
+        "Выберите действие:",
+        reply_markup=main_menu(), parse_mode="HTML")
+
+    if is_new and referrer_id:
+        if not REF_BONUS_REQUIRE_PAID or await user_has_paid(referrer_id):
+            if await log_promo_use(f"ref_reg_{referrer_id}", user.id, "reg", REF_BONUS_DAYS):
+                await add_bonus_days(referrer_id, REF_BONUS_DAYS)
+                try:
+                    new_bonus = await get_bonus_days(referrer_id)
+                    await bot.send_message(referrer_id,
+                        f"🎉 <b>+{REF_BONUS_DAYS} бонусных дня!</b>\n\n"
+                        f"По вашей ссылке зарегистрировался новый юзер.\n"
+                        f"Всего: <b>{new_bonus}</b>", parse_mode="HTML")
+                except Exception:
+                    pass
+
+    if is_new:
+        async with _db_conn.execute(
+            "SELECT got_trial FROM users WHERE user_id=?", (user.id,)
+        ) as cur:
+            row = await cur.fetchone()
+        if row and not row["got_trial"]:
+            key_data = await get_available_key("trial") or await get_available_key("1_month")
+            if key_data:
+                key_id, key_value = key_data
+                expire_date = (datetime.now() + timedelta(days=TRIAL_DAYS)).strftime("%d.%m.%Y")
+                await mark_key_used(key_id, user.id, user.username or "", expire_date)
+                await _db_conn.execute("UPDATE users SET got_trial=1 WHERE user_id=?", (user.id,))
+                await _db_conn.commit()
+                await message.answer(
+                    f"🎁 <b>Триал активирован!</b>\n\n"
+                    f"📅 до {expire_date}\n\n🔑 <code>{key_value}</code>",
+                    reply_markup=key_buttons(key_value), parse_mode="HTML")
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    await message.answer(
+        "❓ <b>Помощь</b>\n\n"
+        "📦 Тарифы — купить\n"
+        "📱 Моя подписка — статус и ключ\n"
+        "⭐ Мой баланс — звёзды\n"
+        "👥 Рефералка — ваша ссылка\n"
+        "🎰 Колесо фортуны — крутите и выигрывайте\n"
+        "🎟 Промокод — активировать код\n"
+        "💬 Поддержка — @Artem_Vladimirovich0",
+        parse_mode="HTML")
+
+
+# ═══════════════════════════════════════════════════════════
+#                     ТАРИФЫ / ПОДПИСКА
+# ═══════════════════════════════════════════════════════════
+
+@dp.message(F.text == "📦 Тарифы")
+async def show_tariffs(message: types.Message):
+    uid = message.from_user.id
+    discount = await get_active_discount(uid)
+
+    text = "📦 <b>Тарифы</b>\n\n"
+    if discount:
+        text += (f"🎁 У вас скидка <b>{discount['percent']}%</b>! "
+                 f"Цены уже со скидкой.\n\n")
+
+    for t in TARIFFS.values():
+        stars = t["stars"]
+        if discount:
+            discounted = apply_discount(stars, discount["percent"])
+            text += (f"• <b>{t['name']}</b> — {t['price']} "
+                     f"(⭐ <s>{stars}</s> <b>{discounted}</b>)\n"
+                     f"  <i>{t['desc']}</i>\n\n")
+        else:
+            text += (f"• <b>{t['name']}</b> — {t['price']} (⭐ {stars})\n"
+                     f"  <i>{t['desc']}</i>\n\n")
+
+    await message.answer(text, reply_markup=tariffs_kb(), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "show_tariffs")
+async def cb_show_tariffs(cb: types.CallbackQuery):
+    await show_tariffs(cb.message)
+    await cb.answer()
+
+
+@dp.message(F.text == "📱 Моя подписка")
+async def my_sub(message: types.Message):
+    uid = message.from_user.id
+    data = await get_user_active_key(uid)
+    discount = await get_active_discount(uid)
+
+    if not data:
+        await message.answer("У вас нет подписки.\nНажмите «📦 Тарифы».",
+                             reply_markup=main_menu())
+        return
+
+    key_value, expire_date, tariff = data
+    left = days_left(expire_date)
+    bonus = await get_bonus_days(uid)
+    balance = await get_stars(uid)
+
+    if bonus >= BONUS_WITHDRAW_THRESHOLD:
+        bonus_line = f"💎 Бонусов: <b>{bonus}</b> ✅ можно забрать {BONUS_WITHDRAW_AMOUNT}"
+    else:
+        bonus_line = f"💎 Бонусов: <b>{bonus}</b> 🔒 (нужно {BONUS_WITHDRAW_THRESHOLD})"
+
+    discount_line = ""
+    if discount:
+        discount_line = (f"\n🎁 <b>Скидка {discount['percent']}%</b> "
+                         f"на следующую покупку\n")
+
+    text = (
+        f"📱 <b>Ваша подписка</b>\n\n"
+        f"Статус: {'✅ Активна' if left > 0 else '❌ Истекла'}\n"
+        f"Тариф: <b>{TARIFFS.get(tariff, {}).get('name', tariff)}</b>\n"
+        f"Действует до: <b>{expire_date}</b>\n"
+        f"Осталось: <b>{left}</b> дней\n\n"
+        f"{bonus_line}\n⭐ Баланс: <b>{balance}</b>\n"
+        f"{discount_line}\n"
+        f"🔑 <code>{key_value}</code>"
+    )
+    rows = [
+        [InlineKeyboardButton(text="📲 Happ", url=f"https://t.me/share/url?url={key_value}"),
+         InlineKeyboardButton(text="📲 Incy", url=f"https://t.me/share/url?url={key_value}")],
+    ]
+    if bonus >= BONUS_WITHDRAW_THRESHOLD:
+        rows.append([InlineKeyboardButton(text=f"💎 Забрать {BONUS_WITHDRAW_AMOUNT} дней",
+                                          callback_data="withdraw_bonus")])
+    rows.append([InlineKeyboardButton(text="📦 Продлить", callback_data="show_tariffs")])
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+                         parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "withdraw_bonus")
+async def cb_withdraw(cb: types.CallbackQuery):
+    uid = cb.from_user.id
+    bonus = await get_bonus_days(uid)
+    if bonus < BONUS_WITHDRAW_THRESHOLD:
+        await cb.answer(f"Нужно {BONUS_WITHDRAW_THRESHOLD}. У вас {bonus}.", show_alert=True)
+        return
+    if not await get_user_active_key(uid):
+        await cb.answer("Нет активной подписки", show_alert=True)
+        return
+    if not await withdraw_bonus(uid, BONUS_WITHDRAW_AMOUNT):
+        await cb.answer("Ошибка", show_alert=True)
+        return
+    new_expire = await extend_user_key(uid, BONUS_WITHDRAW_AMOUNT)
+    if not new_expire:
+        await add_bonus_days(uid, BONUS_WITHDRAW_AMOUNT)
+        await cb.answer("Ошибка продления", show_alert=True)
+        return
+    remaining = await get_bonus_days(uid)
+    await cb.message.answer(
+        f"💎 <b>+{BONUS_WITHDRAW_AMOUNT} дней добавлено!</b>\n"
+        f"📅 до <b>{new_expire}</b>\n\nОсталось бонусов: <b>{remaining}</b>",
+        parse_mode="HTML")
+    await cb.answer("✅")
+
+
+@dp.message(F.text == "ℹ️ О сервисе")
+async def about(message: types.Message):
+    await message.answer(
+        "🔒 <b>Vortex VPN</b>\n\n"
+        "• Без логов\n• Скорость\n• 17 локаций\n• Все платформы",
+        parse_mode="HTML")
+
+
+@dp.message(F.text == "💬 Поддержка")
+async def support(message: types.Message):
+    await message.answer("Поддержка: @Artem_Vladimirovich0")
+
+
+# ═══════════════════════════════════════════════════════════
+#                     РЕФЕРАЛКА
+# ═══════════════════════════════════════════════════════════
+
+@dp.message(F.text == "👥 Рефералка")
+async def referral(message: types.Message):
+    uid = message.from_user.id
+    bot_info = await bot.get_me()
+    link = f"https://t.me/{bot_info.username}?start=ref_{uid}"
+    bonus = await get_bonus_days(uid)
+    invited = await count_referrals(uid)
+
+    await message.answer(
+        f"👥 <b>Рефералка</b>\n\n"
+        f"🎁 +{REF_BONUS_DAYS} дня — за регистрацию друга\n"
+        f"💰 +{REF_BONUS_PAID_DAYS} дня — за оплату друга\n\n"
+        f"Ваша ссылка:\n<code>{link}</code>\n\n"
+        f"Приглашено: <b>{invited}</b>\n"
+        f"Бонусных дней: <b>{bonus}</b>\n\n"
+        f"🎖 4–5 места — скидка 15% · 🏅 6–10 — скидка 10%",
+        parse_mode="HTML")
+
+
+# ═══════════════════════════════════════════════════════════
+#                     БАЛАНС
+# ═══════════════════════════════════════════════════════════
+
+@dp.message(F.text == "⭐ Мой баланс")
+async def show_balance(message: types.Message):
+    uid = message.from_user.id
+    balance = await get_stars(uid)
+    discount = await get_active_discount(uid)
+
+    lines, buttons = [], []
+    for k, t in TARIFFS.items():
+        price = t["stars"]
+        if discount:
+            price = apply_discount(price, discount["percent"])
+        if balance >= price:
+            icon = "✅"
+            buttons.append([InlineKeyboardButton(
+                text=f"⭐ Купить {t['name']} за {price} ⭐",
+                callback_data=f"balance_pay_{k}")])
+        elif balance > 0:
+            icon = f"💳 (доплатить {price - balance})"
+            buttons.append([InlineKeyboardButton(
+                text=f"💳 {t['name']}: {balance}+{price - balance} Stars",
+                callback_data=f"hybrid_pay_{k}")])
+        else:
+            icon = "🔒"
+        lines.append(f"{icon} {t['name']} — <b>{price}</b> ⭐")
+
+    header = ""
+    if discount:
+        header = (f"🎁 <b>У вас скидка {discount['percent']}% "
+                  f"на покупку!</b>\n\n")
+
+    await message.answer(
+        f"⭐ <b>Баланс: {balance} ⭐</b>\n\n{header}" + "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None,
+        parse_mode="HTML")
+
+
+# ═══════════════════════════════════════════════════════════
+#                     ПРОМОКОДЫ
+# ═══════════════════════════════════════════════════════════
+
+@dp.message(F.text == "🎟 Промокод")
+async def ask_promo(message: types.Message, state: FSMContext):
+    await message.answer("Введите промокод:")
+    await state.set_state(Order.waiting_promo)
+
+
+@dp.message(Order.waiting_promo)
+async def process_promo(message: types.Message, state: FSMContext):
+    code = (message.text or "").strip().upper()
+    uid = message.from_user.id
+    await state.clear()
+
+    promo = await get_promo(code)
+    if not promo:
+        await message.answer("❌ Промокод не найден")
+        return
+    if promo["used_count"] >= promo["max_uses"]:
+        await message.answer("❌ Лимит исчерпан")
+        return
+    if await promo_was_used(code, uid):
+        await message.answer("❌ Вы уже использовали этот промокод")
+        return
+
+    if not await log_promo_use(code, uid, "promo",
+                                promo["days"] or promo["stars"] or promo.get("spins", 0)):
+        await message.answer("❌ Вы уже использовали этот промокод")
+        return
+
+    await promo_inc_used(code)
+
+    results = []
+    if promo["days"] > 0:
+        await add_bonus_days(uid, promo["days"])
+        results.append(f"🎁 +{promo['days']} бонусных дней")
+    if promo["stars"] > 0:
+        new_balance = await add_stars(uid, promo["stars"])
+        results.append(f"⭐ +{promo['stars']} звёзд\n💰 Баланс: {new_balance} ⭐")
+    if promo.get("spins", 0) > 0:
+        await add_free_spins(uid, promo["spins"])
+        total = await get_free_spins(uid)
+        results.append(f"🎰 +{promo['spins']} спинов\n🎁 Всего спинов: {total}")
+
+    if not results:
+        await message.answer("⚠️ Промокод активирован, но не даёт бонусов.")
+        return
+
+    await message.answer(
+        "✅ <b>Промокод активирован!</b>\n\n" + "\n".join(results)
+        + "\n\n👉 Откройте «🎰 Колесо фортуны»!",
+        parse_mode="HTML")
+
+
+# ═══════════════════════════════════════════════════════════
+#                     КОЛЕСО ФОРТУНЫ
+# ═══════════════════════════════════════════════════════════
+
+async def animate_spin(msg, final_prize_text: str):
+    faces = ["1 ⭐", "3 ⭐", "😢", "5 ⭐", "10 ⭐", "1 д", "15 ⭐", "3 ⭐", "25 ⭐", "😢"]
+    offset = 0
+    delays = [0.15, 0.15, 0.15, 0.2, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5]
+
+    for i, delay in enumerate(delays):
+        window = [faces[(offset + j) % len(faces)] for j in range(4)]
+        offset += 1
+        top_arrow = "▼" if i % 2 == 0 else "▲"
+        bot_arrow = "▲" if i % 2 == 0 else "▼"
+        text = (
+            f"🎰 <b>Крутим...</b>\n"
+            f"🎯 {top_arrow}\n"
+            f"┃ {window[0]} ┃ {window[1]} ┃ {window[2]} ┃ {window[3]} ┃\n"
+            f"   {bot_arrow}\n"
+            f"🎯 {'▼' if i % 2 == 0 else '▲'}"
+        )
+        try:
+            await msg.edit_text(text, parse_mode="HTML")
+        except Exception:
+            pass
+        await asyncio.sleep(delay)
+
+    try:
+        await msg.edit_text(final_prize_text, parse_mode="HTML")
+    except Exception:
+        pass
+
+
+@dp.message(F.text == "🎰 Колесо фортуны")
+async def show_wheel(message: types.Message):
+    if not SPIN_ENABLED:
+        await message.answer("🎰 Колесо временно недоступно")
+        return
+    uid = message.from_user.id
+    can_free, cooldown, is_bonus = await can_free_spin(uid)
+    balance = await get_stars(uid)
+    stats = await get_spin_stats(uid)
+    bonus_spins = await get_free_spins(uid)
+
+    if can_free and is_bonus:
+        free_text = f"🎁 <b>У вас {bonus_spins} бонусных спинов!</b>"
+    elif can_free:
+        free_text = "🎁 <b>Доступен бесплатный спин!</b>"
+    else:
+        free_text = f"⏳ Следующий бесплатный через <b>{fmt_seconds(cooldown)}</b>"
+        if bonus_spins > 0:
+            free_text += f"\n🎁 Бонусных спинов: <b>{bonus_spins}</b>"
+
+    text = (
+        f"🎰 <b>Колесо фортуны</b>\n\n"
+        f"Крутите и выигрывайте звёзды и дни подписки!\n\n"
+        f"🎁 <b>Призы:</b>\n"
+        f"• 1–25 ⭐ разной редкости\n"
+        f"• 1 день или 7 дней подписки\n"
+        f"• 😢 Пусто (тоже бывает)\n\n"
+        f"{free_text}\n"
+        f"💰 Баланс: <b>{balance}</b> ⭐\n"
+        f"📊 Спинов: <b>{stats['total_spins']}</b>\n"
+        f"🎯 Выиграно: <b>{stats['total_won_stars']}</b> ⭐"
+        + (f" + <b>{stats['total_won_days']}</b> дн." if stats['total_won_days'] else "")
+    )
+    await message.answer(text, reply_markup=spin_keyboard(can_free, is_bonus, bonus_spins),
+                         parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "spin_free")
+async def cb_spin_free(callback: types.CallbackQuery):
+    if not SPIN_ENABLED:
+        await callback.answer("Отключено", show_alert=True)
+        return
+    uid = callback.from_user.id
+    can_free, cooldown, is_bonus = await can_free_spin(uid)
+    if not can_free:
+        await callback.answer(f"Следующий через {fmt_seconds(cooldown)}", show_alert=True)
+        return
+
+    used_bonus = False
+    if is_bonus:
+        if not await use_free_spin(uid):
+            await callback.answer("Бонусный спин использован", show_alert=True)
+            return
+        used_bonus = True
+
+    await callback.answer()
+    msg = await callback.message.answer("🎰 Крутим...")
+    prize_type, value = spin_wheel()
+
+    if prize_type == "star":
+        new_balance = await add_stars(uid, value)
+        final = (f"🎉 <b>Поздравляем!</b>\n\n"
+                 f"╔══════════════════╗\n"
+                 f"║  <b>+{value} ⭐</b>        ║\n"
+                 f"╚══════════════════╝\n\n"
+                 f"💰 Баланс: <b>{new_balance}</b> ⭐\n")
+        if not used_bonus:
+            final += f"⏳ Следующий спин через <b>{SPIN_FREE_COOLDOWN_DAYS} дн.</b>"
+        else:
+            remaining = await get_free_spins(uid)
+            if remaining > 0:
+                final += f"🎁 Осталось бонусных: <b>{remaining}</b>"
+    elif prize_type == "day":
+        await add_bonus_days(uid, value)
+        new_bonus = await get_bonus_days(uid)
+        final = (f"🎉 <b>Супер-приз!</b>\n\n"
+                 f"╔══════════════════╗\n"
+                 f"║  <b>+{value} дн.</b>       ║\n"
+                 f"╚══════════════════╝\n\n"
+                 f"🎁 Бонусных дней: <b>{new_bonus}</b>")
+    else:
+        final = "😢 <b>Пусто...</b>\n\nВ следующий раз повезёт!"
+        if not used_bonus:
+            final += f"\n⏳ Бесплатный спин через <b>{SPIN_FREE_COOLDOWN_DAYS} дн.</b>"
+
+    await animate_spin(msg, final)
+    await record_spin(uid, prize_type, value, is_free=not used_bonus)
+
+    if value >= 25 or prize_type == "day":
+        try:
+            await bot.send_message(ADMIN_ID,
+                f"🎰 Крупный выигрыш: @{callback.from_user.username or uid} — "
+                f"{prize_type} {value}")
+        except Exception:
+            pass
+
+
+@dp.callback_query(F.data == "spin_paid")
+async def cb_spin_paid(callback: types.CallbackQuery):
+    if not SPIN_ENABLED:
+        await callback.answer("Отключено", show_alert=True)
+        return
+    uid = callback.from_user.id
+    balance = await get_stars(uid)
+    if balance < SPIN_PAID_COST:
+        await callback.answer(f"Нужно {SPIN_PAID_COST} ⭐. У вас {balance}.", show_alert=True)
+        return
+    if not await spend_stars(uid, SPIN_PAID_COST):
+        await callback.answer("Ошибка списания", show_alert=True)
+        return
+
+    await callback.answer()
+    msg = await callback.message.answer("🎰 Крутим...")
+    prize_type, value = spin_wheel()
+
+    if prize_type == "star":
+        new_balance = await add_stars(uid, value)
+        net = value - SPIN_PAID_COST
+        final = (f"🎉 <b>+{value} ⭐!</b>\n\n"
+                 f"💰 Баланс: <b>{new_balance}</b> ⭐\n"
+                 f"Чистыми: {'+' if net >= 0 else ''}{net} ⭐")
+    elif prize_type == "day":
+        await add_bonus_days(uid, value)
+        new_bonus = await get_bonus_days(uid)
+        final = (f"🎉 <b>+{value} дн. подписки!</b>\n\n"
+                 f"🎁 Бонусных: <b>{new_bonus}</b>")
+    else:
+        new_balance = await get_stars(uid)
+        final = (f"😢 <b>Пусто...</b>\n\nПотрачено: {SPIN_PAID_COST} ⭐\n"
+                 f"💰 Баланс: <b>{new_balance}</b> ⭐")
+
+    await animate_spin(msg, final)
+    await record_spin(uid, prize_type, value, is_free=False)
+
+
+@dp.callback_query(F.data == "spin_stats")
+async def cb_spin_stats(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    stats = await get_spin_stats(uid)
+    can_free, cooldown, _ = await can_free_spin(uid)
+    free_line = ("🎁 Бесплатный спин: <b>доступен</b>" if can_free
+                 else f"⏳ Бесплатный спин: через <b>{fmt_seconds(cooldown)}</b>")
+    await callback.message.answer(
+        f"📊 <b>Ваша статистика</b>\n\n"
+        f"🎯 Спинов: <b>{stats['total_spins']}</b>\n"
+        f"⭐ Выиграно звёзд: <b>{stats['total_won_stars']}</b>\n"
+        f"🎁 Выиграно дней: <b>{stats['total_won_days']}</b>\n\n{free_line}",
+        parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "spin_leaderboard")
+async def cb_spin_leaderboard(callback: types.CallbackQuery):
+    if not SPIN_LEADERBOARD_ENABLED:
+        await callback.answer("Отключено", show_alert=True)
+        return
+    uid = callback.from_user.id
+    top = await get_spin_leaderboard(limit=SPIN_LEADERBOARD_LIMIT, days=7)
+    my_rank = await get_user_spin_rank(uid, days=7)
+
+    if not top:
+        await callback.message.answer(
+            "🏆 <b>Топ спинов</b>\n\nПока пусто — на этой неделе никто не крутил.\n"
+            "Будьте первым!", parse_mode="HTML")
+        await callback.answer()
+        return
+
+    text = "🏆 <b>Топ спинов за 7 дней</b>\n\n"
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for i, r in enumerate(top, 1):
+        medal = medals.get(i, f"{i}.")
+        marker = " ← <b>вы!</b>" if r["user_id"] == uid else ""
+        line = f"{medal} <code>{r['user_id']}</code> — <b>{r['total_stars']}</b> ⭐"
+        if r["total_days"] > 0:
+            line += f" + <b>{r['total_days']}</b> дн."
+        line += f" ({r['spins_count']} спинов){marker}\n"
+        text += line
+
+    text += "\n🎁 <b>Призы в конце недели:</b>\n"
+    text += f"🥇 1 место — <b>+{SPIN_WEEKLY_PRIZES[1]['stars']} ⭐</b> и <b>{SPIN_WEEKLY_PRIZES[1]['spins']} спинов</b>\n"
+    text += f"🥈 2 место — <b>+{SPIN_WEEKLY_PRIZES[2]['stars']} ⭐</b> и <b>{SPIN_WEEKLY_PRIZES[2]['spins']} спина</b>\n"
+    text += f"🥉 3 место — <b>+{SPIN_WEEKLY_PRIZES[3]['stars']} ⭐</b> и <b>{SPIN_WEEKLY_PRIZES[3]['spins']} спин</b>\n"
+    text += f"🎖 4–5 места — <b>скидка 15%</b> (не сгорает)\n"
+    text += f"🏅 6–10 места — <b>скидка 10%</b> (не сгорает)\n"
+
+    if my_rank:
+        text += (f"\n━━━━━━━━━━━━━━━\n"
+                 f"📊 <b>Ваше место:</b> #{my_rank['rank']}\n"
+                 f"⭐ Выиграно: <b>{my_rank['total_stars']}</b>"
+                 + (f" + <b>{my_rank['total_days']}</b> дн." if my_rank['total_days'] else "")
+                 + f"\n🎰 Спинов: <b>{my_rank['spins_count']}</b>")
+    else:
+        text += "\n\n💡 Крутите колесо — попадёте в топ!"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="spin_leaderboard")],
+        [InlineKeyboardButton(text="🎰 К колесу", callback_data="spin_open")],
+    ])
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "spin_open")
+async def cb_spin_open(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    can_free, cooldown, is_bonus = await can_free_spin(uid)
+    balance = await get_stars(uid)
+    bonus_spins = await get_free_spins(uid)
+
+    if can_free and is_bonus:
+        free_text = f"🎁 <b>У вас {bonus_spins} бонусных спинов!</b>"
+    elif can_free:
+        free_text = "🎁 <b>Доступен бесплатный спин!</b>"
+    else:
+        free_text = f"⏳ Следующий бесплатный через <b>{fmt_seconds(cooldown)}</b>"
+        if bonus_spins > 0:
+            free_text += f"\n🎁 Бонусных спинов: <b>{bonus_spins}</b>"
+
+    text = (f"🎰 <b>Колесо фортуны</b>\n\n"
+            f"{free_text}\n💰 Баланс: <b>{balance}</b> ⭐")
+    try:
+        await callback.message.edit_text(text,
+            reply_markup=spin_keyboard(can_free, is_bonus, bonus_spins),
+            parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text,
+            reply_markup=spin_keyboard(can_free, is_bonus, bonus_spins),
+            parse_mode="HTML")
+    await callback.answer()
+
+
+# ═══════════════════════════════════════════════════════════
+#                     ОПЛАТА
+# ═══════════════════════════════════════════════════════════
+
+@dp.callback_query(F.data.startswith("buy_") & ~F.data.startswith("buy_balance_"))
+async def process_buy(cb: types.CallbackQuery):
+    tk = cb.data.split("_", 1)[1]
+    tariff = TARIFFS.get(tk)
+    if not tariff:
+        await cb.answer("Тариф не найден", show_alert=True)
+        return
+    await cb.message.answer(
+        f"Вы выбрали: <b>{tariff['name']}</b>\n"
+        f"Стоимость: {tariff['price']} / ⭐ {tariff['stars']} Stars\n\n"
+        f"Выберите оплату:",
+        reply_markup=pay_kb(tk), parse_mode="HTML")
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("pay_stars_"))
+async def pay_stars(cb: types.CallbackQuery):
+    tk = cb.data.split("_", 2)[2]
+    tariff = TARIFFS.get(tk)
+    if not tariff:
+        await cb.answer("Ошибка", show_alert=True)
+        return
+
+    uid = cb.from_user.id
+    price = tariff["stars"]
+
+    # скидка из топа
+    discount = await get_active_discount(uid)
+    if discount:
+        price = apply_discount(price, discount["percent"])
+
+    balance = await get_stars(uid)
+
+    if balance >= price:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"⭐ С баланса ({price} ⭐)",
+                                  callback_data=f"balance_pay_{tk}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_pay")]])
+        await cb.message.answer(
+            f"🎁 <b>Хватает с баланса!</b>\n\n"
+            f"📦 {tariff['name']} — <b>{price}</b> ⭐\n"
+            f"💰 Баланс: <b>{balance}</b> ⭐",
+            reply_markup=kb, parse_mode="HTML")
+    elif balance > 0:
+        remaining = price - balance
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 {balance} ⭐ + {remaining} Stars",
+                                  callback_data=f"hybrid_pay_{tk}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_pay")]])
+        await cb.message.answer(
+            f"⭐ <b>Гибридная оплата</b>\n\n"
+            f"📦 {tariff['name']} — <b>{price}</b> ⭐\n\n"
+            f"💰 Баланс: <b>{balance}</b> ⭐\n"
+            f"💳 Доплата: <b>{remaining}</b> Stars",
+            reply_markup=kb, parse_mode="HTML")
+    else:
+        await bot.send_invoice(
+            chat_id=uid,
+            title=f"Vortex VPN — {tariff['name']}",
+            description=f"Подписка на {tariff['name']}",
+            payload=f"vortex|{tk}|{uid}|use_balance=0",
+            currency="XTR",
+            prices=[LabeledPrice(label=tariff["name"], amount=price)])
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("balance_pay_"))
+async def cb_balance_pay(cb: types.CallbackQuery):
+    tk = cb.data.split("_", 2)[2]
+    tariff = TARIFFS.get(tk)
+    if not tariff:
+        await cb.answer("Ошибка", show_alert=True)
+        return
+    uid = cb.from_user.id
+    price = tariff["stars"]
+    discount = await get_active_discount(uid)
+    if discount:
+        price = apply_discount(price, discount["percent"])
+    if not await spend_stars(uid, price):
+        await cb.answer("Недостаточно звёзд", show_alert=True)
+        return
+
+    # скидка использована
+    if discount:
+        await use_discount(discount["id"])
+
+    ok = await grant_subscription(cb.from_user, tk, tariff, paid_stars=0)
+    if not ok:
+        await add_stars(uid, price)
+        await cb.answer("Нет ключей, звёзды возвращены", show_alert=True)
+        return
+    await cb.answer("✅ Готово!")
+
+
+@dp.callback_query(F.data.startswith("hybrid_pay_"))
+async def cb_hybrid_pay(cb: types.CallbackQuery):
+    tk = cb.data.split("_", 2)[2]
+    tariff = TARIFFS.get(tk)
+    if not tariff:
+        await cb.answer("Ошибка", show_alert=True)
+        return
+    uid = cb.from_user.id
+    price = tariff["stars"]
+    discount = await get_active_discount(uid)
+    if discount:
+        price = apply_discount(price, discount["percent"])
+    balance = await get_stars(uid)
+    use_balance = min(balance, price - 1)
+    if use_balance <= 0:
+        await cb.answer("Недостаточно", show_alert=True)
+        return
+    remaining = price - use_balance
+    await bot.send_invoice(
+        chat_id=uid,
+        title=f"Vortex VPN — {tariff['name']}",
+        description=f"{use_balance} ⭐ с баланса + {remaining} Stars",
+        payload=f"vortex|{tk}|{uid}|use_balance={use_balance}",
+        currency="XTR",
+        prices=[LabeledPrice(label=tariff["name"], amount=remaining)])
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "cancel_pay")
+async def cb_cancel(cb: types.CallbackQuery):
+    await cb.message.edit_text("❌ Отменено")
+    await cb.answer()
+
+
+@dp.pre_checkout_query()
+async def pre_checkout(q: PreCheckoutQuery):
+    await q.answer(ok=True)
+
+
+@dp.message(F.successful_payment)
+async def successful_payment(message: types.Message):
+    payment = message.successful_payment
+    payload = payment.invoice_payload or ""
+    user = message.from_user
+
+    tk, use_balance = None, 0
+    try:
+        parts = payload.split("|")
+        if len(parts) >= 3 and parts[0] == "vortex":
+            tk = parts[1]
+            for p in parts:
+                if p.startswith("use_balance="):
+                    use_balance = int(p.split("=", 1)[1])
+    except Exception:
+        pass
+
+    tariff = TARIFFS.get(tk)
+    if not tariff:
+        await message.answer("✅ Оплата получена. Напишите @Artem_Vladimirovich0")
+        try:
+            await bot.send_message(ADMIN_ID, f"⚠️ Bad payload: {payload}, user={user.id}")
+        except Exception:
+            pass
+        return
+
+    ok = await grant_subscription(user, tk, tariff, paid_stars=payment.total_amount)
+    if use_balance > 0 and ok:
+        await spend_stars(user.id, use_balance)
+
+    # скидка сгорела
+    discount = await get_active_discount(user.id)
+    if discount:
+        await use_discount(discount["id"])
+
+    await apply_referral_paid(user)
+
+    try:
+        bal = f"\n-{use_balance} ⭐ с баланса" if use_balance else ""
+        await bot.send_message(ADMIN_ID,
+            f"✅ Оплата\n{tariff['name']} → @{user.username or user.id}\n"
+            f"Stars: {payment.total_amount}{bal}")
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════
+#                     CRYPTO
+# ═══════════════════════════════════════════════════════════
+
+@dp.callback_query(F.data.startswith("pay_crypto_"))
+async def pay_crypto(cb: types.CallbackQuery):
+    tk = cb.data.split("_", 2)[2]
+    tariff = TARIFFS.get(tk)
+    if not tariff or cp is None:
+        await cb.answer("Недоступно", show_alert=True)
+        return
+    rub = int(tariff["price"].replace(" ₽", "").replace(" ", ""))
+    amount = round(rub * CRYPTO_PAY_RATE, 2)
+    try:
+        inv = await cp.create_invoice(amount=amount, asset=CRYPTO_PAY_ASSET,
+            description=f"Vortex VPN — {tariff['name']}",
+            payload=f"vc|{tk}|{cb.from_user.id}", expires_in=3600)
+    except Exception as e:
+        logger.error(f"crypto create: {e}")
+        await cb.answer("Ошибка счёта", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Оплатить", url=inv.bot_invoice_url)],
+        [InlineKeyboardButton(text="✅ Я оплатил",
+                              callback_data=f"crypto_check_{inv.invoice_id}")]])
+    await cb.message.answer(
+        f"🪙 <b>Крипта</b>\n\n"
+        f"📦 {tariff['name']}\n💰 <b>{amount} {CRYPTO_PAY_ASSET}</b>\n\n"
+        f"1. Оплатите в @CryptoBot\n2. Вернитесь и нажмите «Я оплатил»",
+        reply_markup=kb, parse_mode="HTML")
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("crypto_check_"))
+async def crypto_check(cb: types.CallbackQuery):
+    if cp is None:
+        await cb.answer("Недоступно", show_alert=True)
+        return
+    try:
+        inv_id = int(cb.data.split("_", 2)[2])
+        invoices = await cp.get_invoices(invoice_ids=inv_id)
+        if not invoices:
+            await cb.answer("Счёт не найден", show_alert=True)
+            return
+        inv = invoices[0]
+    except Exception as e:
+        logger.error(f"crypto get: {e}")
+        await cb.answer("Ошибка проверки", show_alert=True)
+        return
+    if inv.status != "paid":
+        await cb.answer("⏳ Ещё не оплачено", show_alert=True)
+        return
+    parts = (inv.payload or "").split("|")
+    tk = parts[1] if len(parts) > 1 else None
+    tariff = TARIFFS.get(tk)
+    if not tariff:
+        await cb.answer("Ошибка тарифа", show_alert=True)
+        return
+    ok = await grant_subscription(cb.from_user, tk, tariff, paid_stars=0)
+    if ok:
+        await apply_referral_paid(cb.from_user)
+    await cb.answer("✅ Готово!")
+    try:
+        await bot.send_message(ADMIN_ID,
+            f"🪙 Крипта: @{cb.from_user.username or cb.from_user.id} — {tariff['name']}")
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.startswith("pay_contact_"))
+async def pay_contact(cb: types.CallbackQuery, state: FSMContext):
+    tk = cb.data.split("_", 2)[2]
+    tariff = TARIFFS.get(tk)
+    if not tariff:
+        await cb.answer("Ошибка", show_alert=True)
+        return
+    await state.update_data(tariff=tariff["name"], price=tariff["price"])
+    await cb.message.answer(
+        f"Отправьте контакт для связи по тарифу <b>{tariff['name']}</b> "
+        f"({tariff['price']}):", parse_mode="HTML")
+    await state.set_state(Order.waiting_contact)
+    await cb.answer()
+
+
+@dp.message(Order.waiting_contact)
+async def process_contact(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    try:
+        await bot.send_message(ADMIN_ID,
+            f"🛒 Заявка\nТариф: {data.get('tariff')}\nЦена: {data.get('price')}\n"
+            f"Контакт: {message.text}\nОт: @{message.from_user.username or message.from_user.id}")
+    except Exception:
+        pass
+    await message.answer("✅ Заявка отправлена!", reply_markup=main_menu())
+    await state.clear()
+
+
+# ═══════════════════════════════════════════════════════════
+#                     АДМИН-КОМАНДЫ
+# ═══════════════════════════════════════════════════════════
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    if not is_admin(message):
+        return
+    await message.answer(
+        "🛠 <b>Админ-команды</b>\n\n"
+        "<b>📊 Основное:</b>\n"
+        "/stats — статистика\n"
+        "/keys — остатки ключей\n"
+        "/finduser USER_ID — инфо о юзере\n"
+        "/broadcast — рассылка\n\n"
+        "<b>🔑 Ключи:</b>\n"
+        "/addkey TARIFF KEY — добавить\n"
+        "/give USER_ID TARIFF — выдать\n\n"
+        "<b>⭐ Звёзды:</b>\n"
+        "/stars_give USER_ID N — начислить\n\n"
+        "<b>🎟 Промокоды:</b>\n"
+        "/addpromo КОД ДНИ ЗВЁЗДЫ СПИНЫ [ЛИМИТ]\n"
+        "/promos — список\n"
+        "/delpromo КОД — удалить\n\n"
+        "<b>🎰 Спины:</b>\n"
+        "/spin_top — топ спинов\n"
+        "/spin_award — начислить топ-3 + скидки\n\n"
+        "<b>Примеры:</b>\n"
+        "<code>/addpromo SPIN5 0 0 5 100</code>\n"
+        "<code>/addpromo MEGA 7 25 5 50</code>",
+        parse_mode="HTML")
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    if not is_admin(message):
+        return
+    s = await get_stats()
+    await message.answer(
+        f"📊 <b>Статистика</b>\n\n"
+        f"👥 Юзеров: <b>{s['users']}</b>\n"
+        f"💰 Продаж: <b>{s['sales']}</b>\n"
+        f"⭐ Stars: <b>{s['stars']}</b>\n\n"
+        f"🔑 Свободно: <b>{s['free_keys']}</b>\n"
+        f"✅ Выдано: <b>{s['used_keys']}</b>",
+        parse_mode="HTML")
+
+
+@dp.message(Command("addkey"))
+async def cmd_addkey(message: types.Message):
+    if not is_admin(message):
+        return
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        await message.answer("Формат: <code>/addkey 1_month vless://...</code>",
+                             parse_mode="HTML")
+        return
+    if await add_key(args[1], args[2]):
+        await message.answer(f"✅ Осталось: {await count_available_keys(args[1])}")
+    else:
+        await message.answer("❌ Уже существует")
+
+
+@dp.message(Command("keys"))
+async def cmd_keys(message: types.Message):
+    if not is_admin(message):
+        return
+    text = "📊 <b>Ключи</b>\n\n"
+    for t in ["trial", "1_month", "3_months", "6_months", "12_months"]:
+        name = "Пробный" if t == "trial" else TARIFFS.get(t, {}).get("name", t)
+        text += f"• {name}: <b>{await count_available_keys(t)}</b>\n"
+    await message.answer(text, parse_mode="HTML")
+
+
+@dp.message(Command("give"))
+async def cmd_give(message: types.Message):
+    if not is_admin(message):
+        return
+    args = message.text.split()
+    if len(args) < 3:
+        await message.answer("Формат: <code>/give USER_ID 1_month</code>", parse_mode="HTML")
+        return
+    try:
+        uid = int(args[1])
+        tk = args[2]
+    except Exception:
+        await message.answer("Ошибка")
+        return
+    tariff = TARIFFS.get(tk) or ({"name": "Триал"} if tk == "trial" else None)
+    if not tariff:
+        await message.answer("Неверный тариф")
+        return
+    days = DURATION_DAYS.get(tk, 30)
+    new_expire = await extend_user_key(uid, days)
+    if new_expire:
+        await message.answer(f"✅ Продлено до {new_expire}")
+        try:
+            await bot.send_message(uid, f"🎁 Подписка продлена до <b>{new_expire}</b>!",
+                                    parse_mode="HTML")
+        except Exception:
+            pass
+        return
+    key_data = await get_available_key(tk)
+    if not key_data:
+        await message.answer("Нет ключей")
+        return
+    key_id, key_value = key_data
+    expire = (datetime.now() + timedelta(days=days)).strftime("%d.%m.%Y")
+    await mark_key_used(key_id, uid, "", expire)
+    try:
+        await bot.send_message(uid,
+            f"🎁 Доступ!\n📅 до <b>{expire}</b>\n\n🔑 <code>{key_value}</code>",
+            parse_mode="HTML")
+        await message.answer(f"✅ Выдан")
+    except Exception as e:
+        await message.answer(f"Записан, но не доставлен: {e}")
+
+
+@dp.message(Command("stars_give"))
+async def cmd_stars_give(message: types.Message):
+    if not is_admin(message):
+        return
+    args = message.text.split()
+    if len(args) < 3:
+        await message.answer("Формат: <code>/stars_give USER_ID 100</code>", parse_mode="HTML")
+        return
+    try:
+        uid = int(args[1])
+        amount = int(args[2])
+    except Exception:
+        await message.answer("Ошибка")
+        return
+    if not await user_exists(uid):
+        await message.answer("Не найден")
+        return
+    bal = await add_stars(uid, amount)
+    await message.answer(f"✅ +{amount} ⭐. Баланс: {bal}")
+    try:
+        await bot.send_message(uid, f"🎁 +{amount} ⭐!\nБаланс: <b>{bal}</b>", parse_mode="HTML")
+    except Exception:
+        pass
+
+
+@dp.message(Command("finduser"))
+async def cmd_finduser(message: types.Message):
+    if not is_admin(message):
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Формат: <code>/finduser USER_ID</code>", parse_mode="HTML")
+        return
+    try:
+        uid = int(args[1])
+    except Exception:
+        await message.answer("USER_ID должен быть числом")
+        return
+    u = await get_user(uid)
+    if not u:
+        await message.answer("Не найден")
+        return
+    active = await get_user_active_key(uid)
+    discount = await get_active_discount(uid)
+    active_text = f"до {active[1]}" if active else "нет"
+    disc_text = f"{discount['percent']}%" if discount else "нет"
+    await message.answer(
+        f"👤 <b>{uid}</b>\n\n"
+        f"Username: @{u['username'] or '—'}\n"
+        f"Реферер: {u['referrer_id'] or '—'}\n"
+        f"Бонусов: <b>{u['bonus_days']}</b>\n"
+        f"⭐ Баланс: <b>{u['stars_balance']}</b>\n"
+        f"🎁 Скидка: <b>{disc_text}</b>\n"
+        f"Триал: {'да' if u['got_trial'] else 'нет'}\n"
+        f"Ключ: {active_text}",
+        parse_mode="HTML")
+
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: types.Message, state: FSMContext):
+    if not is_admin(message):
+        return
+    await message.answer("Отправьте сообщение для рассылки:")
+    await state.set_state(Order.waiting_broadcast)
+
+
+@dp.message(Order.waiting_broadcast)
+async def process_broadcast(message: types.Message, state: FSMContext):
+    if not is_admin(message):
+        return
+    await state.clear()
+    users = await get_all_user_ids()
+    await message.answer(f"Рассылаю на {len(users)}...")
+    ok = fail = 0
+    for uid in users:
+        try:
+            await bot.copy_message(chat_id=uid, from_chat_id=message.chat.id,
+                                    message_id=message.message_id)
+            ok += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.05)
+    await message.answer(f"✅ Готово\nУспешно: {ok}\nОшибок: {fail}")
+
+
+# ═══════════════════════════════════════════════════════════
+#               АДМИН: ПРОМОКОДЫ / СПИНЫ
+# ═══════════════════════════════════════════════════════════
+
+@dp.message(Command("addpromo"))
+async def cmd_addpromo(message: types.Message):
+    if not is_admin(message):
+        return
+    args = message.text.split()
+    if len(args) < 5:
+        await message.answer(
+            "📝 <b>Создание промокода</b>\n\n"
+            "<b>Формат:</b> <code>/addpromo КОД ДНИ ЗВЁЗДЫ СПИНЫ [ЛИМИТ]</code>\n\n"
+            "<b>Примеры:</b>\n"
+            "<code>/addpromo SUMMER 5 15 0 100</code>\n"
+            "<code>/addpromo SPIN5 0 0 5 50</code>\n"
+            "<code>/addpromo MEGA 30 50 10 5</code>",
+            parse_mode="HTML")
+        return
+    code = args[1].upper().strip()
+    if not code.isalnum() or len(code) > 20:
+        await message.answer("❌ Код: буквы/цифры, до 20")
+        return
+    try:
+        days = int(args[2])
+        stars = int(args[3])
+        spins = int(args[4])
+        limit = int(args[5]) if len(args) > 5 else 100
+    except ValueError:
+        await message.answer("❌ Числа в полях")
+        return
+    if days < 0 or stars < 0 or spins < 0:
+        await message.answer("❌ Отрицательные нельзя")
+        return
+    if days == 0 and stars == 0 and spins == 0:
+        await message.answer("❌ Хоть что-то должно быть")
+        return
+    if limit < 1 or limit > 10000:
+        await message.answer("❌ Лимит: 1-10000")
+        return
+    ok = await create_promo(code, days, stars, limit, message.from_user.id, spins=spins)
+    if not ok:
+        await message.answer(f"❌ Промокод <b>{code}</b> уже существует", parse_mode="HTML")
+        return
+    parts = []
+    if days > 0: parts.append(f"🎁 +{days}д")
+    if stars > 0: parts.append(f"⭐ +{stars}⭐")
+    if spins > 0: parts.append(f"🎰 +{spins} спинов")
+    await message.answer(
+        f"✅ <b>Промокод создан!</b>\n\n"
+        f"🔑 <code>{code}</code>\n"
+        f"📦 {' + '.join(parts)}\n"
+        f"🔢 Лимит: <b>{limit}</b>",
+        parse_mode="HTML")
+
+
+@dp.message(Command("promos"))
+async def cmd_promos(message: types.Message):
+    if not is_admin(message):
+        return
+    promos = await list_promos()
+    if not promos:
+        await message.answer("📭 Нет промокодов.")
+        return
+    text = f"🎟 <b>Промокоды</b> ({len(promos)})\n\n"
+    for p in promos:
+        gives = []
+        if p["days"] > 0: gives.append(f"+{p['days']}д")
+        if p["stars"] > 0: gives.append(f"+{p['stars']}⭐")
+        if p.get("spins", 0) > 0: gives.append(f"+{p['spins']}🎰")
+        text += (f"🔑 <code>{p['code']}</code> — {' + '.join(gives)}\n"
+                 f"   Использовано: {p['used_count']}/{p['max_uses']}\n\n")
+    text += "Удалить: <code>/delpromo КОД</code>"
+    await message.answer(text, parse_mode="HTML")
+
+
+@dp.message(Command("delpromo"))
+async def cmd_delpromo(message: types.Message):
+    if not is_admin(message):
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Формат: <code>/delpromo КОД</code>", parse_mode="HTML")
+        return
+    code = args[1].upper()
+    if await delete_promo(code):
+        await message.answer(f"✅ <b>{code}</b> удалён", parse_mode="HTML")
+    else:
+        await message.answer(f"❌ Не найден")
+
+
+@dp.message(Command("spin_top"))
+async def cmd_spin_top(message: types.Message):
+    if not is_admin(message):
+        return
+    top = await get_spin_leaderboard(limit=20, days=7)
+    if not top:
+        await message.answer("Пока никто не крутил")
+        return
+    text = "🏆 <b>Топ спинов (админ)</b>\n\n"
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for i, r in enumerate(top, 1):
+        text += (f"{medals.get(i, f'{i}.')} <code>{r['user_id']}</code> — "
+                 f"{r['total_stars']} ⭐"
+                 + (f" + {r['total_days']} дн." if r['total_days'] else "")
+                 + f" ({r['spins_count']} спинов)\n")
+    await message.answer(text, parse_mode="HTML")
+
+
+# ═══════════════════════════════════════════════════════════
+#                     НАПОМИНАНИЯ
+# ═══════════════════════════════════════════════════════════
+
+async def reminder_task():
+    await asyncio.sleep(30)
+    while True:
+        try:
+            expiring = await get_expiring_keys(days_before=2)
+            for key_id, user_id, expire_date in expiring:
+                if not user_id:
+                    continue
+                try:
+                    await bot.send_message(user_id,
+                        f"⚠️ <b>Напоминание</b>\n\n"
+                        f"Подписка заканчивается <b>{expire_date}</b>.\n"
+                        f"Продлите: «📦 Тарифы».",
+                        parse_mode="HTML")
+                except Exception:
+                    pass
+                await mark_reminded(key_id)
+        except Exception as e:
+            logger.error(f"reminder: {e}")
+        await asyncio.sleep(60 * 60 * 12)
+
+
+async def spin_reminder_task():
+    await asyncio.sleep(60)
+    while True:
+        try:
+            soon = await get_users_to_remind_spin(hours_ahead=1)
+            for uid in soon:
+                try:
+                    can_free, _, _ = await can_free_spin(uid)
+                    if not can_free:
+                        continue
+                    balance = await get_stars(uid)
+                    await bot.send_message(uid,
+                        f"🎰 <b>Ваш бесплатный спин готов!</b>\n\n"
+                        f"💰 Баланс: <b>{balance}</b> ⭐\n\n"
+                        f"👉 Откройте «🎰 Колесо фортуны»",
+                        parse_mode="HTML")
+                    await mark_spin_reminded(uid)
+                except TelegramForbiddenError:
+                    await mark_spin_reminded(uid)
+                except Exception as e:
+                    logger.warning(f"spin reminder {uid}: {e}")
+                await asyncio.sleep(0.1)
+
+            inactive = await get_inactive_spinners(days=7)
+            for uid in inactive:
+                try:
+                    await bot.send_message(uid,
+                        f"🎰 <b>Соскучились по колесу!</b>\n\n"
+                        f"Ваш бесплатный спин ждёт.",
+                        parse_mode="HTML")
+                    await mark_inactive_reminded(uid)
+                except TelegramForbiddenError:
+                    await mark_inactive_reminded(uid)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.error(f"spin_reminder: {e}")
+        await asyncio.sleep(30 * 60)
+
+
+async def run_spin_weekly_award():
+    now = datetime.utcnow()
+    week_end = now.strftime("%Y-%m-%d")
+    week_start = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+    top = await get_spin_leaderboard(limit=SPIN_LEADERBOARD_LIMIT, days=7)
+    if not top:
+        return
+    admin_lines = [f"🏆 <b>Итоги топ-спинов {week_start} → {week_end}</b>\n"]
+    for place, row in enumerate(top, start=1):
+        uid = row["user_id"]
+        prizes = SPIN_WEEKLY_PRIZES.get(place)
+        if prizes:
+            if await already_spin_rewarded(uid, week_start):
+                continue
+            if prizes["stars"] > 0:
+                await add_stars(uid, prizes["stars"])
+            if prizes["spins"] > 0:
+                await add_free_spins(uid, prizes["spins"])
+            await log_spin_weekly_winner(
+                week_start, week_end, place, uid,
+                row["spins_count"], row["total_stars"], row["total_days"],
+                prizes["stars"], prizes["spins"])
+            medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(place, "🏅")
+            try:
+                parts = []
+                if prizes["stars"] > 0: parts.append(f"⭐ +{prizes['stars']} ⭐")
+                if prizes["spins"] > 0: parts.append(f"🎰 +{prizes['spins']} спинов")
+                await bot.send_message(uid,
+                    f"{medal} <b>{place} место в топе спинов!</b>\n\n"
+                    f"🎰 Спинов: <b>{row['spins_count']}</b>\n"
+                    f"⭐ Выиграно: <b>{row['total_stars']}</b>\n\n"
+                    f"🎁 <b>Награда:</b>\n" + "\n".join(parts),
+                    parse_mode="HTML")
+            except Exception:
+                pass
+            admin_lines.append(f"{medal} {place}: <code>{uid}</code> → +{prizes['stars']} ⭐, +{prizes['spins']} спинов")
+        else:
+            pct = get_leaderboard_discount(place)
+            if pct > 0:
+                await grant_discount(uid, pct, source="spin_top", place=place)
+                try:
+                    await bot.send_message(uid,
+                        f"🎖 <b>{place} место в топе спинов!</b>\n\n"
+                        f"🎰 Спинов: <b>{row['spins_count']}</b>\n"
+                        f"⭐ Выиграно: <b>{row['total_stars']}</b>\n\n"
+                        f"🎁 <b>Награда:</b> скидка <b>{pct}%</b> на покупку!\n"
+                        f"💾 Скидка сохранится на вашем аккаунте.",
+                        parse_mode="HTML")
+                except Exception:
+                    pass
+                admin_lines.append(f"🎖 {place}: <code>{uid}</code> → скидка {pct}%")
+    try:
+        await bot.send_message(ADMIN_ID, "\n".join(admin_lines), parse_mode="HTML")
+    except Exception:
+        pass
+
+
+async def spin_weekly_task():
+    if not SPIN_LEADERBOARD_ENABLED:
+        return
+    await asyncio.sleep(90)
+    now = datetime.utcnow()
+    days_ahead = (7 - now.weekday()) % 7
+    if days_ahead == 0 and (now.hour > 0 or now.minute > 0):
+        days_ahead = 7
+    next_monday = (now + timedelta(days=days_ahead)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    wait_seconds = (next_monday - now).total_seconds()
+    logger.info(f"Spin weekly: следующий запуск через {wait_seconds/3600:.1f} ч")
+    await asyncio.sleep(wait_seconds)
+    while True:
+        try:
+            await run_spin_weekly_award()
+        except Exception as e:
+            logger.error(f"spin_weekly: {e}")
+        await asyncio.sleep(7 * 24 * 60 * 60)
+
+
+@dp.message(Command("spin_award"))
+async def cmd_spin_award(message: types.Message):
+    if not is_admin(message):
+        return
+    await message.answer("🧪 Запускаю начисление...")
+    try:
+        await run_spin_weekly_award()
+        await message.answer("✅ Готово")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+
+# ═══════════════════════════════════════════════════════════
+#                     СТАРТ
+# ═══════════════════════════════════════════════════════════
+
+async def set_commands():
+    try:
+        await bot.set_my_commands([
+            types.BotCommand(command="start", description="🏠 Меню"),
+            types.BotCommand(command="help", description="❓ Помощь"),
+        ])
+    except Exception:
+        pass
+
+
+async def main():
+    await db_init()
+    me = await bot.get_me()
+    logger.info(f"Vortex VPN LITE запущен как @{me.username}")
+    await set_commands()
+
+    reminder = asyncio.create_task(reminder_task())
+    spin_reminder = asyncio.create_task(spin_reminder_task())
+    spin_weekly = asyncio.create_task(spin_weekly_task())
+
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        reminder.cancel()
+        spin_reminder.cancel()
+        spin_weekly.cancel()
+        for t in (reminder, spin_reminder, spin_weekly):
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+        if _db_conn:
+            await _db_conn.close()
+        await bot.session.close()
+        logger.info("Бот остановлен")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Ctrl+C")
